@@ -2,7 +2,6 @@ import logging
 from gettext import gettext as _
 
 from django.utils.timezone import now
-from rest_framework.serializers import ValidationError
 
 from pulpcore.app.models import Artifact, ProgressReport, storage
 from pulpcore.app.serializers import DomainBackendMigratorSerializer
@@ -25,24 +24,30 @@ def migrate_backend(data):
     artifacts = Artifact.objects.filter(pulp_domain=domain)
     date = now()
 
+    skipped = []
     with ProgressReport(
         message=_("Migrating Artifacts"), code="migrate", total=artifacts.count()
     ) as pb:
         while True:
-            for digest in pb.iter(artifacts.values_list("sha256", flat=True)):
-                filename = storage.get_artifact_path(digest)
-                if not new_storage.exists(filename):
+            for artifact in pb.iter(artifacts.iterator()):
+                old_name = artifact.file.name
+                new_name = storage.get_artifact_path(artifact.sha256)
+                if not new_storage.exists(new_name):
                     try:
-                        file = old_storage.open(filename)
-                    except FileNotFoundError:
-                        raise ValidationError(
-                            _(
-                                "Found missing file for artifact(sha256={}). Please run the repair "
-                                "task or delete the offending artifact."
-                            ).format(digest)
+                        file = old_storage.open(old_name)
+                    except Exception as e:
+                        _logger.warning(
+                            "Skipping artifact(sha256=%s): unable to read from old storage: %s",
+                            artifact.sha256,
+                            e,
                         )
-                    new_storage.save(filename, file)
+                        skipped.append(artifact.sha256)
+                        continue
+                    new_storage.save(new_name, file)
                     file.close()
+                if old_name != new_name:
+                    artifact.file.name = new_name
+                    artifact.save(update_fields=["file"])
             # Handle new artifacts saved by the content app
             artifacts = Artifact.objects.filter(pulp_domain=domain, pulp_created__gte=date)
             if count := artifacts.count():
@@ -51,6 +56,13 @@ def migrate_backend(data):
                 date = now()
                 continue
             break
+
+    if skipped:
+        _logger.warning(
+            "Migration completed with %d skipped artifacts (missing from old storage): %s",
+            len(skipped),
+            ", ".join(skipped),
+        )
 
     # Update the current domain to the new storage backend settings
     msg = _("Update Domain({domain})'s Backend Settings").format(domain=domain.name)
